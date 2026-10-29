@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Send a plain-text email through Proton Mail SMTP submission.
+
+  proton-send DRAFT          show the headers and body that would be sent
+  proton-send --send DRAFT   send it
+  proton-send --check        log in and out, send nothing
+
+DRAFT holds header lines (To and Subject; optionally Cc, Bcc, Reply-To,
+In-Reply-To, References), an empty line, then the body.
+
+Configuration in ~/.config/proton-smtp/:
+  from   the sender, e.g. "Jane Doe <jane@example.org>"; Proton allows SMTP
+         only for custom domain addresses
+  token  an SMTP token for that address, readable only by you (chmod 600)
+"""
+import argparse
+import contextlib
+import os
+import smtplib
+import ssl
+import stat
+import sys
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid, parseaddr
+
+CONFIG = os.path.expanduser('~/.config/proton-smtp')
+HOST, PORT = 'smtp.protonmail.ch', 587
+ORDER = ('From', 'To', 'Cc', 'Bcc', 'Reply-To', 'Subject', 'In-Reply-To', 'References')
+DRAFT_HEADERS = {name.lower(): name for name in ORDER[1:]}
+ADDRESS_HEADERS = ('To', 'Cc', 'Bcc', 'Reply-To')
+
+
+def read_config(name):
+    path = os.path.join(CONFIG, name)
+    try:
+        # The token can send mail as you.
+        if name == 'token' and os.stat(path).st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            sys.exit(f'{path} must be readable only by its owner (chmod 600)')
+        with open(path, encoding='utf-8') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        sys.exit(f'{path} is missing, see proton-send --help')
+
+
+def sender():
+    value = read_config('from')
+    address = parseaddr(value)[1]
+    if '@' not in address:
+        sys.exit(f'{CONFIG}/from must hold an address like "Jane Doe <jane@example.org>"')
+    return value, address
+
+
+def load_draft(path, from_header):
+    with open(path, encoding='utf-8') as f:
+        text = f.read()
+    if '\n\n' not in text:
+        sys.exit('the draft needs an empty line between the headers and the body')
+    head, body = text.split('\n\n', 1)
+    lines = []
+    for line in head.splitlines():
+        # RFC 5322 folding: an indented line continues the previous header.
+        if line[:1] in (' ', '\t') and lines:
+            lines[-1] += ' ' + line.strip()
+        else:
+            lines.append(line)
+
+    msg = EmailMessage()
+    msg['From'] = from_header
+    for line in lines:
+        name, _, value = line.partition(':')
+        name = DRAFT_HEADERS.get(name.strip().lower())
+        if not name or not value.strip():
+            sys.exit(f'unexpected header line: {line!r}')
+        if name in msg:
+            sys.exit(f'{name} appears twice; put it on one line')
+        msg[name] = value.strip()
+    if 'To' not in msg or 'Subject' not in msg:
+        sys.exit('the draft needs To and Subject')
+    for name in ADDRESS_HEADERS:
+        header = msg[name]
+        # The parser silently drops or mangles addresses after a ';' or without an '@'.
+        if header is not None and (header.defects or any('@' not in a.addr_spec for a in header.addresses)):
+            sys.exit(f'{name}: cannot parse {str(header)!r}; write "Name <user@example.org>", separated by commas')
+
+    msg['Date'] = formatdate(localtime=True)
+    msg['Message-ID'] = make_msgid(domain=parseaddr(from_header)[1].rpartition('@')[2])
+    # Quoted-printable keeps long command lines intact; format=flowed would rewrap them.
+    msg.set_content(body, cte='quoted-printable')
+    return msg
+
+
+@contextlib.contextmanager
+def session(address):
+    try:
+        with smtplib.SMTP(HOST, PORT, timeout=30) as smtp:
+            # Never set a debuglevel: it would print the AUTH exchange, i.e. the token.
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.login(address, read_config('token'))
+            yield smtp
+    except (smtplib.SMTPException, OSError) as e:
+        sys.exit(f'{HOST}: {e}')
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('draft', nargs='?')
+    p.add_argument('--send', action='store_true', help='send the draft')
+    p.add_argument('--check', action='store_true', help='only test the login')
+    a = p.parse_args()
+
+    from_header, address = sender()
+    if a.check:
+        with session(address):
+            pass
+        print(f'login to {HOST} as {address} works; nothing was sent')
+        return
+    if not a.draft:
+        p.error('DRAFT is required')
+
+    msg = load_draft(a.draft, from_header)
+    if not a.send:
+        for name in ORDER:
+            if msg[name] is not None:
+                note = '  (hidden from the other recipients)' if name == 'Bcc' else ''
+                print(f'{name}: {msg[name]}{note}')
+        print()
+        print(msg.get_content(), end='', flush=True)
+        print('\n(dry run, nothing was sent; add --send to send)', file=sys.stderr)
+        return
+
+    with session(address) as smtp:
+        refused = smtp.send_message(msg)
+    recipients = [addr.addr_spec for name in ('To', 'Cc', 'Bcc') if msg[name] for addr in msg[name].addresses]
+    print(f"sent {msg['Message-ID']} to {', '.join(r for r in recipients if r not in refused)}")
+    if refused:
+        sys.exit(f"refused: {', '.join(refused)}")
+
+
+if __name__ == '__main__':
+    main()
